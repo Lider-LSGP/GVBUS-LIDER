@@ -605,3 +605,224 @@ def parse_saldo(content: bytes, filename: str) -> SaldoTable:
         header_row_index=header_idx,
         sheet_used=sheet_idx,
     )
+
+
+# ===========================================================================
+# Parser da planilha do AppLider (Matrícula + Nome + Tipo Escala)
+# ===========================================================================
+
+@dataclass
+class AppLiderRow:
+    """Uma linha da planilha do AppLider, com os campos que nos interessam."""
+    matricula: str        # matrícula do colaborador (mesmo id do TXT)
+    nome: str             # nome oficial (assumido como correto)
+    escala_raw: str       # texto original vindo da planilha
+    escala: str           # normalizado (5x2, 6x1, 12x36P, 12x36I, 2x2A, 2x2B, DESCONHECIDA)
+    empresa: str = ""     # opcional — pra filtrar por empresa se quiser
+    ativo: str = ""       # "Sim"/"Não"
+    posto: str = ""
+
+
+@dataclass
+class AppLiderTable:
+    df: pd.DataFrame           # colunas: matricula, nome, escala_raw, escala, empresa, ativo, posto
+    n_rows: int
+    n_ignored: int
+    header_row_index: int
+    sheet_used: int
+    raw_columns: dict          # {"matricula": "Matricula", "nome": "Nome", ...}
+
+
+# heurísticas de detecção do cabeçalho AppLider
+#
+# IMPORTANTE: usamos a coluna "Matrícula/Modal" (número do cartão GVBUS) como
+# matrícula — essa é a mesma numeração que aparece no TXT comercial e no
+# PDF do GVBUS. A coluna "Matricula" (id interno do AppLider) NÃO deve ser
+# usada, pois é um id diferente do cartão.
+_APPLIDER_MAT_KEYS = ("matricula/modal", "matrícula/modal",
+                       "matriculamodal", "matrículamodal", "modal")
+_APPLIDER_NOME_KEYS = ("nome",)
+_APPLIDER_ESCALA_KEYS = ("tipo escala", "tipo/escala", "escala")
+_APPLIDER_EMPRESA_KEYS = ("empresa",)
+_APPLIDER_ATIVO_KEYS = ("ativo",)
+_APPLIDER_POSTO_KEYS = ("posto trabalho", "posto de trabalho", "posto")
+
+
+def _normalize_applider_cell(v) -> str:
+    """Remove \\n, nbsp, zero-width e HTML entities comuns do AppLider."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and pd.isna(v):
+        return ""
+    s = str(v)
+    s = s.replace("\xa0", " ").replace("\u200b", "").replace("\n", " ")
+    # entities comuns
+    s = (
+        s.replace("&aacute;", "á").replace("&eacute;", "é")
+         .replace("&iacute;", "í").replace("&oacute;", "ó")
+         .replace("&uacute;", "ú").replace("&atilde;", "ã")
+         .replace("&otilde;", "õ").replace("&ccedil;", "ç")
+         .replace("&Aacute;", "Á").replace("&Eacute;", "É")
+         .replace("&Iacute;", "Í").replace("&Oacute;", "Ó")
+         .replace("&Uacute;", "Ú").replace("&Atilde;", "Ã")
+         .replace("&Otilde;", "Õ").replace("&Ccedil;", "Ç")
+    )
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _find_applider_column(header_row: list, keys: tuple[str, ...]) -> Optional[int]:
+    """
+    Procura a coluna cujo header casa com uma das keys. Prioriza o casamento
+    com a key mais específica (mais longa) para desambiguar casos como
+    'Matricula' vs 'Matrícula/Modal' — se ambas as keys estiverem na busca,
+    a mais específica ('matricula/modal') vence.
+    """
+    candidates: list[tuple[int, int]] = []  # (indice_coluna, comprimento_key)
+    for j, v in enumerate(header_row):
+        norm = _strip_accents(str(v)).replace(" ", "")
+        # remove espaços para casar 'matrícula/modal' contra 'matricula/modal'
+        for k in keys:
+            kn = k.replace(" ", "")
+            if kn in norm:
+                candidates.append((j, len(kn)))
+                break
+    if not candidates:
+        return None
+    # devolve a coluna cuja key foi a mais específica (critério de desempate:
+    # menor índice)
+    candidates.sort(key=lambda t: (-t[1], t[0]))
+    return candidates[0][0]
+
+
+def parse_applider(content: bytes, filename: str) -> AppLiderTable:
+    """
+    Lê a planilha do AppLider (.xls binário ou .xlsx) e devolve um DataFrame
+    normalizado com as colunas essenciais.
+
+    O layout esperado tem cabeçalho na linha 0:
+      Id | Nome | CPF: | Sexo | DT/Nasc: | Tipo Escala | Função: | ...
+      ...| Matricula | ...
+
+    Mas o parser detecta o header automaticamente (procura nas 15 primeiras
+    linhas) para ser resiliente a mudanças no export.
+    """
+    from .escala import normalizar_escala
+
+    tables = _try_read_any(content, filename)
+    if not tables:
+        raise ValueError("Não foi possível ler a planilha do AppLider.")
+
+    best = None
+    best_score = -1
+    for sheet_idx, raw_df in enumerate(tables):
+        if raw_df is None or raw_df.empty:
+            continue
+        if isinstance(raw_df.columns, pd.MultiIndex):
+            raw_df.columns = [
+                " ".join([str(x) for x in tup if str(x) != "nan"]).strip()
+                for tup in raw_df.columns
+            ]
+        df = raw_df.reset_index(drop=True)
+
+        # procura cabeçalho nas primeiras 15 linhas — precisa ter Matrícula/Modal
+        # + nome + escala
+        header_idx = None
+        for i in range(min(15, len(df))):
+            row = df.iloc[i].tolist()
+            has_mat = any(
+                ("modal" in _strip_accents(str(c)).replace(" ", ""))
+                for c in row
+            )
+            has_nom = any(_cell_matches(c, _APPLIDER_NOME_KEYS) for c in row)
+            has_esc = any(_cell_matches(c, _APPLIDER_ESCALA_KEYS) for c in row)
+            if has_mat and has_nom and has_esc:
+                header_idx = i
+                break
+
+        if header_idx is None:
+            continue
+
+        header_row = df.iloc[header_idx].tolist()
+        col_mat = _find_applider_column(header_row, _APPLIDER_MAT_KEYS)
+        col_nom = _find_applider_column(header_row, _APPLIDER_NOME_KEYS)
+        col_esc = _find_applider_column(header_row, _APPLIDER_ESCALA_KEYS)
+        col_emp = _find_applider_column(header_row, _APPLIDER_EMPRESA_KEYS)
+        col_ativo = _find_applider_column(header_row, _APPLIDER_ATIVO_KEYS)
+        col_posto = _find_applider_column(header_row, _APPLIDER_POSTO_KEYS)
+
+        n_rows = len(df) - header_idx - 1
+        score = n_rows
+
+        if score > best_score:
+            best_score = score
+            best = (df, header_idx, sheet_idx, {
+                "mat": col_mat, "nom": col_nom, "esc": col_esc,
+                "emp": col_emp, "ativo": col_ativo, "posto": col_posto,
+            })
+
+    if best is None:
+        raise ValueError(
+            "Não foi possível localizar as colunas necessárias na planilha do "
+            "AppLider. O cabeçalho precisa conter, nas primeiras 15 linhas, "
+            "as colunas **Matrícula/Modal** (número do cartão GVBUS), "
+            "**Nome** e **Tipo Escala**."
+        )
+
+    df, header_idx, sheet_idx, cols = best
+    header_row = df.iloc[header_idx].tolist()
+    raw_columns = {
+        k: (_normalize_applider_cell(header_row[cols[k]]) if cols[k] is not None else "")
+        for k in cols
+    }
+
+    data = df.iloc[header_idx + 1:].copy().reset_index(drop=True)
+    total_lines = len(data)
+
+    matricula = data.iloc[:, cols["mat"]].map(_clean_matricula)
+    nome = data.iloc[:, cols["nom"]].map(_normalize_applider_cell)
+    escala_raw = data.iloc[:, cols["esc"]].map(_normalize_applider_cell)
+    escala = escala_raw.map(normalizar_escala)
+
+    def _series_or_blank(idx):
+        if idx is None:
+            return pd.Series([""] * len(data))
+        return data.iloc[:, idx].map(_normalize_applider_cell)
+
+    empresa = _series_or_blank(cols["emp"])
+    ativo = _series_or_blank(cols["ativo"])
+    posto = _series_or_blank(cols["posto"])
+
+    norm = pd.DataFrame({
+        "matricula": matricula,
+        "nome": nome,
+        "escala_raw": escala_raw,
+        "escala": escala,
+        "empresa": empresa,
+        "ativo": ativo,
+        "posto": posto,
+    })
+
+    # filtros: só considera linhas com matrícula válida
+    norm = norm[norm["matricula"] != ""]
+    norm = norm[norm["matricula"].str.match(r"^[A-Za-z0-9]+$", na=False)]
+    # se tiver duplicata de matrícula, prefere a linha mais completa
+    # (com escala != DESCONHECIDA)
+    norm = norm.sort_values(
+        by=["matricula", "escala"],
+        key=lambda s: s.map(lambda x: 1 if x == "DESCONHECIDA" else 0)
+        if s.name == "escala" else s
+    )
+    norm = norm.drop_duplicates(subset=["matricula"], keep="first").reset_index(drop=True)
+
+    n_ignored = total_lines - len(norm)
+    if norm.empty:
+        raise ValueError("A planilha do AppLider está sem colaboradores válidos.")
+
+    return AppLiderTable(
+        df=norm,
+        n_rows=len(norm),
+        n_ignored=n_ignored,
+        header_row_index=header_idx,
+        sheet_used=sheet_idx,
+        raw_columns=raw_columns,
+    )
