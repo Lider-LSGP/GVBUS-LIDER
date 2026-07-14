@@ -65,7 +65,13 @@ from .parser import TxtRow, _format_brl
 # ---------------------------------------------------------------------------
 
 VALOR_VALE_PADRAO = 5.10
-VALES_POR_DIA = 2       # ida + volta
+VALES_POR_DIA_PADRAO = 2       # ida + volta
+VALES_POR_DIA_ESPECIAL = 1     # postos com passagem em cima (ex.: CETURB)
+
+# Palavras-chave no campo `Posto Trabalho:` do AppLider que sinalizam "1 vale
+# por dia". Comparado em uppercase e sem acento. Alterável por parâmetro no
+# `compare()` caso a Lider Limpe passe a ter outros clientes com essa regra.
+POSTOS_1_VALE_PADRAO: tuple[str, ...] = ("CETURB",)
 
 
 # ---------------------------------------------------------------------------
@@ -318,9 +324,9 @@ class ResultRow:
     saldo_pdf: float       # saldo bruto do PDF/planilha GVBUS
     # --- separação MÊS ATUAL vs MÊS SEGUINTE ---
     dias_mes_atual: int    # dias trabalhados no restante do mês atual (consome PDF)
-    consumo_mes_atual: float   # dias_mes_atual × 2 × valor_vale
+    consumo_mes_atual: float   # dias_mes_atual × vales_por_dia × valor_vale
     dias_mes_seg: int      # dias trabalhados no mês seguinte (informativo)
-    consumo_mes_seg: float # dias_mes_seg × 2 × valor_vale (informativo)
+    consumo_mes_seg: float # dias_mes_seg × vales_por_dia × valor_vale (informativo)
     # --- agregado (retrocompat) ---
     dias_periodo: int      # = dias_mes_atual + dias_mes_seg
     consumo_periodo: float # = consumo_mes_atual + consumo_mes_seg
@@ -334,6 +340,9 @@ class ResultRow:
     posto: str = ""
     manual: bool = False        # True → 2x2 (revisão manual)
     sem_escala: bool = False    # True → não achou no AppLider
+    vales_por_dia: int = 2      # 2 = ida+volta padrão; 1 = passagem em cima
+    posto_1_vale: bool = False  # True se caiu na regra CETURB / posto-especial
+    regra_1_vale: str = ""      # palavra-chave que casou (ex.: 'CETURB')
 
 
 @dataclass
@@ -354,6 +363,8 @@ class ComparisonResult:
     qtd_corrigidos: int = 0
     qtd_manuais_2x2: int = 0
     qtd_sem_escala: int = 0
+    qtd_posto_1_vale: int = 0             # quantos caem na regra CETURB
+    economia_1_vale: float = 0.0          # o quanto se economizou vs 2 vales/dia
     # metadados
     periodo_inicio: Optional[date] = None
     periodo_fim: Optional[date] = None
@@ -364,6 +375,7 @@ class ComparisonResult:
     mes_seg_fim: Optional[date] = None
     valor_vale: float = VALOR_VALE_PADRAO
     n_feriados: int = 0
+    postos_1_vale: tuple[str, ...] = POSTOS_1_VALE_PADRAO
 
 
 # status válidos:
@@ -377,6 +389,30 @@ STATUS_LABELS = {
 }
 
 
+def _norm_posto(s: str) -> str:
+    """Normaliza o nome do posto para comparar sem acento/caixa."""
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFD", str(s))
+    return (
+        "".join(c for c in s if unicodedata.category(c) != "Mn")
+        .upper()
+        .strip()
+    )
+
+
+def _match_posto_1_vale(posto: str, keys: tuple[str, ...]) -> Optional[str]:
+    """Se o posto casar com alguma palavra-chave, retorna a key que casou.
+    Senão retorna None. Comparado sem acento e em UPPER."""
+    posto_norm = _norm_posto(posto)
+    if not posto_norm:
+        return None
+    for k in keys:
+        if _norm_posto(k) in posto_norm:
+            return k
+    return None
+
+
 def compare(
     txt_rows: List[TxtRow],
     saldo_df: pd.DataFrame,               # GVBUS: matricula → saldo, nome
@@ -387,6 +423,7 @@ def compare(
     valor_vale: float = VALOR_VALE_PADRAO,
     applider_overrides: Optional[Dict[int, str]] = None,
     feriados_customizados: Optional[set[date]] = None,
+    postos_1_vale: Optional[tuple[str, ...]] = None,
 ) -> ComparisonResult:
     """
     Executa a comparação principal.
@@ -414,8 +451,13 @@ def compare(
         do TXT no arquivo final)
     feriados_customizados : override total dos feriados (se None, usa
         Grande Vitória automaticamente)
+    postos_1_vale : tupla de palavras-chave que, se aparecerem no campo
+        `Posto Trabalho:` do AppLider, indicam que o colaborador usa apenas
+        1 vale/dia (“passagem em cima”). Padrão: ('CETURB',). Comparação é
+        case-insensitive e sem acento.
     """
     applider_overrides = applider_overrides or {}
+    postos_1_vale = postos_1_vale or POSTOS_1_VALE_PADRAO
     if feriados_customizados is None:
         feriados = feriados_no_periodo(periodo_inicio, periodo_fim)
     else:
@@ -472,6 +514,7 @@ def compare(
         mes_seg_fim=mes_seg_fim,
         valor_vale=valor_vale,
         n_feriados=len(feriados),
+        postos_1_vale=postos_1_vale,
     )
 
     for i, row in enumerate(txt_rows):
@@ -497,6 +540,11 @@ def compare(
 
         sem_escala = escala_can == "DESCONHECIDA"
         manual = escala_can in ("2x2A", "2x2B")
+
+        # regra CETURB (posto especial → 1 vale/dia)
+        posto_match = _match_posto_1_vale(posto, postos_1_vale)
+        posto_1_vale_flag = posto_match is not None
+        vales_dia = VALES_POR_DIA_ESPECIAL if posto_1_vale_flag else VALES_POR_DIA_PADRAO
 
         # padrões (recalculados no caminho normal)
         dias_atual = 0
@@ -534,7 +582,7 @@ def compare(
                 feriados=feriados,
                 escala_ancora_mes=periodo_inicio,
             )
-            consumo_atual = round(dias_atual * VALES_POR_DIA * valor_vale, 2)
+            consumo_atual = round(dias_atual * vales_dia * valor_vale, 2)
 
             # MÊS SEGUINTE: dias trabalhados no início do próximo mês dentro do
             # período de apuração. Esse consumo é INFORMATIVO — o próprio TXT
@@ -546,7 +594,7 @@ def compare(
                     feriados=feriados,
                     escala_ancora_mes=periodo_inicio,
                 )
-                consumo_seg = round(dias_seg * VALES_POR_DIA * valor_vale, 2)
+                consumo_seg = round(dias_seg * vales_dia * valor_vale, 2)
 
             # Saldo disponível quando começar o próximo mês:
             # só o consumo do MÊS ATUAL desconta do PDF.
@@ -595,6 +643,9 @@ def compare(
             posto=posto,
             manual=manual,
             sem_escala=sem_escala,
+            vales_por_dia=vales_dia,
+            posto_1_vale=posto_1_vale_flag,
+            regra_1_vale=posto_match or "",
         ))
         result.total_txt += valor_txt
         result.total_depositar += valor_final
@@ -603,8 +654,14 @@ def compare(
         result.total_consumo_mes_seg += consumo_seg
         result.total_consumo_periodo += (consumo_atual + consumo_seg)
         result.total_saldo_ajustado += saldo_ajustado
+        if posto_1_vale_flag:
+            result.qtd_posto_1_vale += 1
+            # o quanto se economizou versus 2 vales/dia
+            economia = (dias_atual + dias_seg) * (VALES_POR_DIA_PADRAO - vales_dia) * valor_vale
+            result.economia_1_vale += round(economia, 2)
 
     result.total_consumo_periodo = round(result.total_consumo_periodo, 2)
+    result.economia_1_vale = round(result.economia_1_vale, 2)
     return result
 
 
@@ -628,7 +685,7 @@ def result_to_txt(result: ComparisonResult) -> str:
 
 def result_to_dataframe(result: ComparisonResult) -> pd.DataFrame:
     """DataFrame rico para exibir no Streamlit (com todas as colunas de detalhe,
-    incluindo a separação mês atual / mês seguinte)."""
+    incluindo a separação mês atual / mês seguinte e a regra CETURB)."""
     # rótulos amigáveis dos subperíodos
     if result.mes_atual_inicio and result.mes_atual_fim:
         rot_atual = (f"{result.mes_atual_inicio.strftime('%d/%m')}–"
@@ -643,12 +700,17 @@ def result_to_dataframe(result: ComparisonResult) -> pd.DataFrame:
 
     data = []
     for r in result.rows:
+        vale_dia = f"R$ {r.vales_por_dia * result.valor_vale:.2f}".replace(".", ",")
+        marcador = f"🔹 {r.regra_1_vale}" if r.posto_1_vale else ""
         data.append({
             "Matrícula": r.matricula,
             "Nome": r.nome,
             "Escala": r.escala_label,
             "Empresa": r.empresa,
             "Posto": r.posto,
+            "Regra especial": marcador,
+            "Vales/dia": r.vales_por_dia,
+            "Custo/dia": vale_dia,
             "Valor TXT (R$)": r.valor_txt,
             "Saldo PDF (R$)": r.saldo_pdf,
             # MÊS ATUAL — desconta do PDF
