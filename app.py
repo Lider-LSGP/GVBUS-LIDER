@@ -871,7 +871,7 @@ r4.markdown(f"""
 # breakdown por status
 st.markdown('<div class="section-title"><span class="dot"></span>Distribuição por status</div>',
             unsafe_allow_html=True)
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 c1.metric("✅ Zerados", result.qtd_zerados_completo,
           help="Saldo do cartão já cobre 100% do valor do TXT — não precisa depositar.")
 c2.metric("💰 Complementos", result.qtd_complemento,
@@ -884,6 +884,12 @@ c5.metric("🖐 2x2 manual", result.qtd_manuais_2x2,
           help="Escala 2x2A/2x2B: não calculamos automaticamente.")
 c6.metric("⚠️ Sem escala", result.qtd_sem_escala,
           help="Ainda não vinculados ao AppLider.")
+c7.metric("🔹 CETURB (1 vale/dia)", result.qtd_posto_1_vale,
+          delta=f"−R$ {_format_brl(result.economia_1_vale)}",
+          delta_color="normal",
+          help=("Colaboradores em posto CETURB usam apenas 1 passagem por "
+                "dia (R$ 5,10) em vez de 2 (R$ 10,20). O delta mostra o "
+                "quanto menos se consome de saldo por causa dessa regra."))
 
 # distribuição por escala (bar chart embutido)
 st.markdown('<div class="section-title"><span class="dot"></span>Distribuição por escala</div>',
