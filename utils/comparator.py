@@ -10,14 +10,21 @@ próximo mês) contra:
    escala de trabalho
 
 E, considerando a **janela de apuração** (data_inicio → data_fim), calcula
-o valor final a depositar por colaborador seguindo esta lógica de precisão:
+o valor final a depositar por colaborador com a seguinte lógica de precisão:
 
-    saldo_disponivel = saldo_pdf − (dias_a_trabalhar_no_periodo × vales_por_dia × valor_vale)
-    a_depositar      = max(valor_txt − max(saldo_disponivel, 0), 0)
+    # separa o período em dois subperíodos:
+    mês_atual    = periodo_inicio → último dia do mês do início
+    mês_seguinte = 1º dia do próximo mês → periodo_fim
 
-Ou seja: o saldo mostrado no PDF ainda vai ser CONSUMIDO pelos dias que
-faltam no mês atual dentro do período. Só o que sobrar de fato é abatido do
-próximo depósito.
+    consumo_mes_atual = dias_trabalhados(mês_atual)  × 2 × valor_vale
+    consumo_mes_seg   = dias_trabalhados(mês_seguinte) × 2 × valor_vale  # informativo
+
+    saldo_ajustado    = max(saldo_pdf − consumo_mes_atual, 0)
+    a_depositar       = max(valor_txt − saldo_ajustado, 0)
+
+Ou seja: o saldo do PDF só é consumido pelo que o colaborador AINDA vai
+gastar no mês atual. O consumo do mês seguinte não entra na conta — o
+próprio depósito do TXT é quem vai cobri-lo.
 
 Casos especiais:
   - 2x2A / 2x2B          → não calculamos; mantém valor do TXT + sinaliza
@@ -31,7 +38,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -48,6 +55,7 @@ from .escala import (
     LABELS_ESCALA,
     dias_trabalhados,
     feriados_no_periodo,
+    primeiro_e_ultimo_dia_do_mes as _primeiro_ultimo_dia_do_mes,
 )
 from .parser import TxtRow, _format_brl
 
@@ -308,9 +316,15 @@ class ResultRow:
     escala_label: str      # amigável
     valor_txt: float
     saldo_pdf: float       # saldo bruto do PDF/planilha GVBUS
-    dias_periodo: int      # dias trabalhados no período de apuração
-    consumo_periodo: float # dias × 2 × valor_vale
-    saldo_ajustado: float  # saldo_pdf − consumo_periodo (não negativo)
+    # --- separação MÊS ATUAL vs MÊS SEGUINTE ---
+    dias_mes_atual: int    # dias trabalhados no restante do mês atual (consome PDF)
+    consumo_mes_atual: float   # dias_mes_atual × 2 × valor_vale
+    dias_mes_seg: int      # dias trabalhados no mês seguinte (informativo)
+    consumo_mes_seg: float # dias_mes_seg × 2 × valor_vale (informativo)
+    # --- agregado (retrocompat) ---
+    dias_periodo: int      # = dias_mes_atual + dias_mes_seg
+    consumo_periodo: float # = consumo_mes_atual + consumo_mes_seg
+    saldo_ajustado: float  # = max(saldo_pdf − consumo_MES_ATUAL, 0)  ← só desconta o atual!
     valor_final: float     # a depositar
     obs: str
     status: str
@@ -328,7 +342,10 @@ class ComparisonResult:
     total_txt: float = 0.0
     total_depositar: float = 0.0
     total_saldo_bruto: float = 0.0
-    total_consumo_periodo: float = 0.0
+    # totais separados
+    total_consumo_mes_atual: float = 0.0  # o que desconta o PDF
+    total_consumo_mes_seg: float = 0.0    # informativo
+    total_consumo_periodo: float = 0.0    # soma dos dois (retrocompat)
     total_saldo_ajustado: float = 0.0
     qtd_zerados_completo: int = 0
     qtd_complemento: int = 0
@@ -340,6 +357,11 @@ class ComparisonResult:
     # metadados
     periodo_inicio: Optional[date] = None
     periodo_fim: Optional[date] = None
+    # subperíodos calculados
+    mes_atual_inicio: Optional[date] = None
+    mes_atual_fim: Optional[date] = None
+    mes_seg_inicio: Optional[date] = None
+    mes_seg_fim: Optional[date] = None
     valor_vale: float = VALOR_VALE_PADRAO
     n_feriados: int = 0
 
@@ -383,9 +405,9 @@ def compare(
         pela matrícula original do TXT (mesmo sistema).
     applider_df : DataFrame do AppLider (matricula, nome, escala, empresa,
         ativo, posto). Se None, todo mundo cai em "sem_escala".
-    periodo_inicio, periodo_fim : janela de apuração (inclusiva). Usada para
-        calcular quantos dias o colaborador AINDA vai trabalhar (e consumir
-        do saldo atual) antes do próximo depósito.
+    periodo_inicio, periodo_fim : janela de apuração (inclusiva). É dividida
+        internamente em **mês atual** (que consome o PDF) e **mês seguinte**
+        (informativo, coberto pelo próprio TXT).
     valor_vale : valor unitário do vale-transporte
     applider_overrides : {txt_index: matricula_applider} — vínculo entre a
         linha do TXT e a ficha correta do AppLider (não altera a matrícula
@@ -416,9 +438,38 @@ def compare(
                 "posto": str(r.get("posto", "")),
             }
 
+    # ------------------------------------------------------------------
+    # Divisão do período em subperíodos: MÊS ATUAL vs MÊS SEGUINTE
+    # ------------------------------------------------------------------
+    # O MÊS ATUAL é o mês do `periodo_inicio` (o colaborador ainda vai gastar
+    # o saldo do PDF durante esses dias). O TXT só cobre a parte do PRÓXIMO
+    # MÊS que está dentro do período de apuração.
+    #
+    # Ex.: período 18/05 → 30/06 →
+    #   MÊS ATUAL   = 18/05 → 31/05  (desconta do saldo PDF)
+    #   MÊS SEGUINTE = 01/06 → 30/06  (informativo; coberto pelo TXT)
+    #
+    # Se o período não cruza a virada de mês (ex.: 05/07 → 20/07), tudo cai
+    # no "mês atual" e o mês seguinte fica vazio.
+    _, _ultimo_dia_mes_ini = _primeiro_ultimo_dia_do_mes(periodo_inicio)
+    if periodo_fim <= _ultimo_dia_mes_ini:
+        mes_atual_ini = periodo_inicio
+        mes_atual_fim = periodo_fim
+        mes_seg_ini = None
+        mes_seg_fim = None
+    else:
+        mes_atual_ini = periodo_inicio
+        mes_atual_fim = _ultimo_dia_mes_ini
+        mes_seg_ini = _ultimo_dia_mes_ini + timedelta(days=1)
+        mes_seg_fim = periodo_fim
+
     result = ComparisonResult(
         periodo_inicio=periodo_inicio,
         periodo_fim=periodo_fim,
+        mes_atual_inicio=mes_atual_ini,
+        mes_atual_fim=mes_atual_fim,
+        mes_seg_inicio=mes_seg_ini,
+        mes_seg_fim=mes_seg_fim,
         valor_vale=valor_vale,
         n_feriados=len(feriados),
     )
@@ -447,44 +498,59 @@ def compare(
         sem_escala = escala_can == "DESCONHECIDA"
         manual = escala_can in ("2x2A", "2x2B")
 
+        # padrões (recalculados no caminho normal)
+        dias_atual = 0
+        dias_seg = 0
+        consumo_atual = 0.0
+        consumo_seg = 0.0
+        saldo_ajustado = saldo_pdf
+
         # --- lógica principal -----------------------------------------------
         if valor_txt <= 0:
             # já zerado no TXT (férias/afastamento) — mantém
-            dias_periodo = 0
-            consumo = 0.0
-            saldo_ajustado = saldo_pdf
             valor_final = 0.0
             status = "mantido"
             result.qtd_mantidos += 1
 
         elif manual:
             # 2x2 — mantém valor cheio e sinaliza
-            dias_periodo = 0
-            consumo = 0.0
-            saldo_ajustado = saldo_pdf
-            valor_final = valor_txt   # mantém original
+            valor_final = valor_txt
             status = "manual_2x2"
             result.qtd_manuais_2x2 += 1
 
         elif sem_escala:
             # sem escala — não gera valor final confiável, sinaliza
-            dias_periodo = 0
-            consumo = 0.0
-            saldo_ajustado = saldo_pdf
-            valor_final = valor_txt   # placeholder — usuário vai resolver
+            valor_final = valor_txt
             status = "sem_escala"
             result.qtd_sem_escala += 1
 
         else:
-            # 5x2 / 6x1 / 12x36
-            qtd_dias, _ = dias_trabalhados(
-                escala_can, periodo_inicio, periodo_fim,
+            # 5x2 / 6x1 / 12x36 — calcula por subperíodo
+            #
+            # MÊS ATUAL: dias que ainda serão trabalhados neste mês.
+            # Esse consumo diminui o saldo do PDF.
+            dias_atual, _ = dias_trabalhados(
+                escala_can, mes_atual_ini, mes_atual_fim,
                 feriados=feriados,
                 escala_ancora_mes=periodo_inicio,
             )
-            dias_periodo = qtd_dias
-            consumo = round(qtd_dias * VALES_POR_DIA * valor_vale, 2)
-            saldo_ajustado = max(saldo_pdf - consumo, 0.0)
+            consumo_atual = round(dias_atual * VALES_POR_DIA * valor_vale, 2)
+
+            # MÊS SEGUINTE: dias trabalhados no início do próximo mês dentro do
+            # período de apuração. Esse consumo é INFORMATIVO — o próprio TXT
+            # é quem cobre esses dias, então não entra no cálculo do saldo
+            # ajustado.
+            if mes_seg_ini is not None:
+                dias_seg, _ = dias_trabalhados(
+                    escala_can, mes_seg_ini, mes_seg_fim,
+                    feriados=feriados,
+                    escala_ancora_mes=periodo_inicio,
+                )
+                consumo_seg = round(dias_seg * VALES_POR_DIA * valor_vale, 2)
+
+            # Saldo disponível quando começar o próximo mês:
+            # só o consumo do MÊS ATUAL desconta do PDF.
+            saldo_ajustado = max(saldo_pdf - consumo_atual, 0.0)
 
             if mat_final not in sheet_map:
                 # sem saldo no cartão (matrícula não no PDF) — deposita cheio
@@ -507,19 +573,23 @@ def compare(
             result.qtd_corrigidos += 1
 
         result.rows.append(ResultRow(
-            matricula=mat_final,      # matrícula do TXT/cartão (nunca muda)
+            matricula=mat_final,
             nome=nome_oficial,
             escala=escala_can,
             escala_label=label.label,
             valor_txt=valor_txt,
             saldo_pdf=saldo_pdf,
-            dias_periodo=dias_periodo,
-            consumo_periodo=consumo,
+            dias_mes_atual=dias_atual,
+            consumo_mes_atual=consumo_atual,
+            dias_mes_seg=dias_seg,
+            consumo_mes_seg=consumo_seg,
+            dias_periodo=dias_atual + dias_seg,
+            consumo_periodo=round(consumo_atual + consumo_seg, 2),
             saldo_ajustado=saldo_ajustado,
             valor_final=valor_final,
             obs=row.obs,
             status=status,
-            original_matricula=original_mat,   # matrícula do AppLider (referência)
+            original_matricula=original_mat,
             foi_corrigida=foi_corrigida,
             empresa=empresa,
             posto=posto,
@@ -529,9 +599,12 @@ def compare(
         result.total_txt += valor_txt
         result.total_depositar += valor_final
         result.total_saldo_bruto += saldo_pdf
-        result.total_consumo_periodo += consumo
+        result.total_consumo_mes_atual += consumo_atual
+        result.total_consumo_mes_seg += consumo_seg
+        result.total_consumo_periodo += (consumo_atual + consumo_seg)
         result.total_saldo_ajustado += saldo_ajustado
 
+    result.total_consumo_periodo = round(result.total_consumo_periodo, 2)
     return result
 
 
@@ -554,7 +627,20 @@ def result_to_txt(result: ComparisonResult) -> str:
 
 
 def result_to_dataframe(result: ComparisonResult) -> pd.DataFrame:
-    """DataFrame rico para exibir no Streamlit (com todas as colunas de detalhe)."""
+    """DataFrame rico para exibir no Streamlit (com todas as colunas de detalhe,
+    incluindo a separação mês atual / mês seguinte)."""
+    # rótulos amigáveis dos subperíodos
+    if result.mes_atual_inicio and result.mes_atual_fim:
+        rot_atual = (f"{result.mes_atual_inicio.strftime('%d/%m')}–"
+                     f"{result.mes_atual_fim.strftime('%d/%m')}")
+    else:
+        rot_atual = "mês atual"
+    if result.mes_seg_inicio and result.mes_seg_fim:
+        rot_seg = (f"{result.mes_seg_inicio.strftime('%d/%m')}–"
+                   f"{result.mes_seg_fim.strftime('%d/%m')}")
+    else:
+        rot_seg = "mês seguinte"
+
     data = []
     for r in result.rows:
         data.append({
@@ -565,14 +651,20 @@ def result_to_dataframe(result: ComparisonResult) -> pd.DataFrame:
             "Posto": r.posto,
             "Valor TXT (R$)": r.valor_txt,
             "Saldo PDF (R$)": r.saldo_pdf,
-            "Dias no período": r.dias_periodo,
-            "Consumo período (R$)": r.consumo_periodo,
+            # MÊS ATUAL — desconta do PDF
+            f"Dias mês atual ({rot_atual})": r.dias_mes_atual,
+            "Consumo mês atual (R$)": r.consumo_mes_atual,
             "Saldo ajustado (R$)": r.saldo_ajustado,
+            # MÊS SEGUINTE — informativo
+            f"Dias mês seg. ({rot_seg})": r.dias_mes_seg,
+            "Consumo mês seg. (R$)": r.consumo_mes_seg,
+            # totais e resultado
+            "Dias no período (total)": r.dias_periodo,
             "A depositar (R$)": r.valor_final,
             "OBS": r.obs,
             "Status": STATUS_LABELS.get(r.status, r.status),
             "Corrigida?": "✓" if r.foi_corrigida else "",
-            "Matr. original": r.original_matricula,
+            "Matr. original (AppLider)": r.original_matricula,
         })
     return pd.DataFrame(data)
 
