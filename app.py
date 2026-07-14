@@ -862,9 +862,10 @@ r3.markdown(f"""
 
 r4.markdown(f"""
 <div class="tile">
-    <div class="label">🚌 Consumo estimado no período</div>
-    <div class="value">R$ {_format_brl(result.total_consumo_periodo)}</div>
-    <div class="subv">saldo ajustado: R$ {_format_brl(result.total_saldo_ajustado)}</div>
+    <div class="label">🚌 Consumo do mês atual (desconta PDF)</div>
+    <div class="value">R$ {_format_brl(result.total_consumo_mes_atual)}</div>
+    <div class="subv">saldo ajustado: R$ {_format_brl(result.total_saldo_ajustado)}<br>
+    mês seguinte (informativo): R$ {_format_brl(result.total_consumo_mes_seg)}</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -897,24 +898,30 @@ st.markdown('<div class="section-title"><span class="dot"></span>Distribuição 
 esc_stats = {}
 for r in result.rows:
     lbl = r.escala_label
-    esc_stats.setdefault(lbl, {"qtd": 0, "depositar": 0.0, "txt": 0.0, "consumo": 0.0})
+    esc_stats.setdefault(lbl, {
+        "qtd": 0, "depositar": 0.0, "txt": 0.0,
+        "consumo_atual": 0.0, "consumo_seg": 0.0,
+    })
     esc_stats[lbl]["qtd"] += 1
     esc_stats[lbl]["depositar"] += r.valor_final
     esc_stats[lbl]["txt"] += r.valor_txt
-    esc_stats[lbl]["consumo"] += r.consumo_periodo
+    esc_stats[lbl]["consumo_atual"] += r.consumo_mes_atual
+    esc_stats[lbl]["consumo_seg"] += r.consumo_mes_seg
 
 esc_df = pd.DataFrame([
     {
         "Escala": lbl,
         "Colaboradores": v["qtd"],
         "Total TXT (R$)": v["txt"],
-        "Consumo período (R$)": v["consumo"],
+        "Consumo mês atual (R$)": v["consumo_atual"],
+        "Consumo mês seg. (R$)": v["consumo_seg"],
         "A depositar (R$)": v["depositar"],
     }
     for lbl, v in esc_stats.items()
 ]).sort_values("Colaboradores", ascending=False)
 esc_df_display = esc_df.copy()
-for col in ["Total TXT (R$)", "Consumo período (R$)", "A depositar (R$)"]:
+for col in ["Total TXT (R$)", "Consumo mês atual (R$)",
+            "Consumo mês seg. (R$)", "A depositar (R$)"]:
     esc_df_display[col] = esc_df_display[col].map(_format_brl)
 st.dataframe(esc_df_display, use_container_width=True, hide_index=True)
 
@@ -927,9 +934,11 @@ st.markdown('<div class="section-title"><span class="dot"></span>Tabela detalhad
 
 df = result_to_dataframe(result)
 df_display = df.copy()
-for col in ["Valor TXT (R$)", "Saldo PDF (R$)", "Consumo período (R$)",
-            "Saldo ajustado (R$)", "A depositar (R$)"]:
-    df_display[col] = df_display[col].map(_format_brl)
+# formata todas as colunas monetárias existentes (nomes de colunas de dias
+# variam com o período, então fazemos por prefixo)
+for col in df_display.columns:
+    if col.endswith("(R$)"):
+        df_display[col] = df_display[col].map(_format_brl)
 
 with st.expander("🔍 Filtros", expanded=False):
     fc1, fc2, fc3 = st.columns([1, 1, 2])
