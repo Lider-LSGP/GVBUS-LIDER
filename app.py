@@ -19,6 +19,7 @@ Execute:
 from __future__ import annotations
 
 import base64
+import gc
 import io
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -451,6 +452,30 @@ with reset_col:
 # Processamento
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# CACHE — evita re-processar o PDF/xls/txt toda vez que o usuário mexe num
+# filtro. O cache expira em 30min (ttl=1800) para liberar RAM.
+# ---------------------------------------------------------------------------
+
+@st.cache_data(show_spinner="📄 Lendo o TXT comercial...", ttl=1800, max_entries=3)
+def _carregar_txt_cache(txt_bytes: bytes):
+    return parse_txt(txt_bytes)
+
+
+@st.cache_data(show_spinner="📊 Lendo o PDF/planilha do GVBUS (pode levar 1-2 minutos em PDFs grandes)...", ttl=1800, max_entries=2)
+def _carregar_saldo_cache(saldo_bytes: bytes, saldo_name: str):
+    result = parse_saldo(saldo_bytes, saldo_name)
+    gc.collect()
+    return result
+
+
+@st.cache_data(show_spinner="🗂 Lendo a planilha do AppLider...", ttl=1800, max_entries=2)
+def _carregar_applider_cache(applider_bytes: bytes, applider_name: str):
+    result = parse_applider(applider_bytes, applider_name)
+    gc.collect()
+    return result
+
+
 if process:
     if not txt_file or not xls_file or not applider_file:
         st.warning(
@@ -463,9 +488,9 @@ if process:
         st.error("⚠️ Período inválido: a data inicial deve ser menor ou igual à final.")
         st.stop()
 
-    # TXT
+    # TXT (cacheado)
     try:
-        txt_rows = parse_txt(txt_file.getvalue())
+        txt_rows = _carregar_txt_cache(txt_file.getvalue())
     except Exception as e:
         st.error(f"Erro ao ler o TXT: {e}")
         st.stop()
@@ -473,9 +498,9 @@ if process:
         st.error("O TXT está vazio ou em formato inválido.")
         st.stop()
 
-    # Saldo
+    # Saldo (cacheado)
     try:
-        saldo_table: SaldoTable = parse_saldo(xls_file.getvalue(), xls_file.name)
+        saldo_table: SaldoTable = _carregar_saldo_cache(xls_file.getvalue(), xls_file.name)
     except FramesetXlsError:
         st.error("⚠️ O arquivo `.xls` enviado está **vazio por dentro**.")
         st.markdown("""
@@ -497,9 +522,9 @@ if process:
         st.error(f"Erro ao ler o saldo GVBUS: {e}")
         st.stop()
 
-    # AppLider
+    # AppLider (cacheado)
     try:
-        applider_table: AppLiderTable = parse_applider(
+        applider_table: AppLiderTable = _carregar_applider_cache(
             applider_file.getvalue(), applider_file.name
         )
     except Exception as e:
@@ -516,6 +541,8 @@ if process:
     st.session_state.confirmed_overrides = {}
     st.session_state.validated_pairs = {}
     st.session_state.sem_escala_decisions = {}
+    # libera memória antes do rerun
+    gc.collect()
     st.rerun()
 
 
