@@ -142,6 +142,21 @@ def _enrich_dataframe(
     # "EmpresaGrupo" — padroniza aqui uma única vez para os dois geradores
     if "EmpresaGrupo" not in df.columns and "Empresa" in df.columns:
         df = df.rename(columns={"Empresa": "EmpresaGrupo"})
+
+    # colunas dinamicas do result_to_dataframe trazem as datas no nome
+    # (ex.: "Dias mes atual (18/05-31/05)") — renomeia para o nome fixo usado no resto do codigo
+    _ren = {}
+    for c in df.columns:
+        if c.startswith("Dias mês atual ("):        _ren[c] = "Dias mês atual"
+        elif c.startswith("Dias mês seg. ("):       _ren[c] = "Dias mês seg."
+        elif c.startswith("Dias mês seg ("):        _ren[c] = "Dias mês seg."
+        elif c == "Dias no período (total)":        _ren[c] = "Dias período (total)"
+    if _ren:
+        df = df.rename(columns=_ren)
+    for _c in ("Dias mês atual", "Dias mês seg.", "Dias período (total)",
+               "Consumo mês atual (R$)", "Consumo mês seg. (R$)", "Saldo ajustado (R$)"):
+        if _c not in df.columns:
+            df[_c] = 0
     df["Contrato"] = df["Posto"].map(extrai_contrato)
 
     if ocorrencias_df is not None and not ocorrencias_df.empty:
@@ -649,7 +664,7 @@ def build_xlsx_workbook(
             r["Matrícula"], r["Nome"], r["Escala"], r[emp_col_name], r["Contrato"], r["Posto"],
             r["Regra especial"] if pd.notna(r["Regra especial"]) else "", r["Vales/dia"], r["Custo/dia"],
             r["Valor TXT (R$)"], r["Saldo PDF (R$)"], r["Dias mês atual"],
-            r["Consumo mês atual (R$)"], r["Saldo ajustado (R$)"], r["Dias mês seg"],
+            r["Consumo mês atual (R$)"], r["Saldo ajustado (R$)"], r["Dias mês seg."],
             r["Consumo mês seg. (R$)"], r["Dias no período (total)"],
             r["A depositar (R$)"], r["OBS"] if pd.notna(r["OBS"]) else "",
             r["Ocorrencias_resumo"], int(r["Dias_descontados_oc"]), r["Status"],
