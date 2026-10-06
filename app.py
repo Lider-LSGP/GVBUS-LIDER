@@ -19,7 +19,6 @@ Execute:
 from __future__ import annotations
 
 import base64
-import gc
 import io
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -55,6 +54,12 @@ from utils.escala import (
     feriados_no_periodo,
     normalizar_escala,
 )
+from utils.relatorio import (
+    build_html_report,
+    build_xlsx_workbook,
+    parse_ocorrencias,
+)
+from utils.mailer import mailer_status, send_report_email
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +269,8 @@ DEFAULTS = {
     "valor_vale": VALOR_VALE_PADRAO,
     "feriados": None,
     "feriados_manual": [],       # feriados adicionais
+    "ocorrencias_df": None,      # DataFrame do relatório de ocorrências (opcional)
+    "ok_sem_oc": False,          # usuário confirmou gerar SEM ocorrências
 }
 for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
@@ -401,7 +408,7 @@ with st.expander("⚙️ Feriados detectados no período (edite se quiser)"):
 st.markdown('<div class="section-title"><span class="dot"></span>2. Enviar arquivos</div>',
             unsafe_allow_html=True)
 
-up_col1, up_col2, up_col3 = st.columns(3, gap="medium")
+up_col1, up_col2, up_col3, up_col4 = st.columns(4, gap="medium")
 with up_col1:
     txt_file = st.file_uploader(
         "📄 TXT comercial",
@@ -421,8 +428,27 @@ with up_col3:
         "🗂 Planilha AppLider (XLS/XLSX)",
         type=["xls", "xlsx"],
         key="applider_uploader",
-        help="Exportação do AppLider com Matrícula + Nome + Tipo Escala.",
+        help="Exportação do AppLider com Matrícula/Modal + Nome + Tipo Escala.",
     )
+with up_col4:
+    oc_file = st.file_uploader(
+        "🩺 Ocorrências (opcional)",
+        type=["xls", "xlsx"],
+        key="oc_uploader",
+        help="Relatório de Ocorrências do AppLider (atestados, faltas, férias...). "
+             "Enriquece os relatórios com o motivo do desconto de cada colaborador.",
+    )
+
+# aviso obrigatório quando o usuário vai gerar SEM ocorrências
+if oc_file is None:
+    st.session_state.ok_sem_oc = st.checkbox(
+        "⚠️ Não anexei o relatório de ocorrências — **sim, gerar mesmo assim** "
+        "(os relatórios saem sem o motivo dos descontos por atestado/falta/férias)",
+        value=st.session_state.ok_sem_oc,
+        key="chk_sem_oc",
+    )
+else:
+    st.session_state.ok_sem_oc = False
 
 st.markdown("")
 
@@ -452,30 +478,6 @@ with reset_col:
 # Processamento
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# CACHE — evita re-processar o PDF/xls/txt toda vez que o usuário mexe num
-# filtro. O cache expira em 30min (ttl=1800) para liberar RAM.
-# ---------------------------------------------------------------------------
-
-@st.cache_data(show_spinner="📄 Lendo o TXT comercial...", ttl=1800, max_entries=3)
-def _carregar_txt_cache(txt_bytes: bytes):
-    return parse_txt(txt_bytes)
-
-
-@st.cache_data(show_spinner="📊 Lendo o PDF/planilha do GVBUS (pode levar 1-2 minutos em PDFs grandes)...", ttl=1800, max_entries=2)
-def _carregar_saldo_cache(saldo_bytes: bytes, saldo_name: str):
-    result = parse_saldo(saldo_bytes, saldo_name)
-    gc.collect()
-    return result
-
-
-@st.cache_data(show_spinner="🗂 Lendo a planilha do AppLider...", ttl=1800, max_entries=2)
-def _carregar_applider_cache(applider_bytes: bytes, applider_name: str):
-    result = parse_applider(applider_bytes, applider_name)
-    gc.collect()
-    return result
-
-
 if process:
     if not txt_file or not xls_file or not applider_file:
         st.warning(
@@ -484,13 +486,24 @@ if process:
         )
         st.stop()
 
+    if oc_file is None and not st.session_state.ok_sem_oc:
+        st.warning(
+            "🩺 **Você não anexou o relatório de ocorrências.**\n\n"
+            "Sem ele, os relatórios saem sem o motivo do desconto de cada "
+            "colaborador (atestado, falta 30 dias, férias...).\n\n"
+            "• Para anexar: use o campo **🩺 Ocorrências (opcional)** acima.\n"
+            "• Para gerar sem ele: marque a caixa **'sim, gerar mesmo assim'** "
+            "e clique em Processar novamente."
+        )
+        st.stop()
+
     if periodo_inicio > periodo_fim:
         st.error("⚠️ Período inválido: a data inicial deve ser menor ou igual à final.")
         st.stop()
 
-    # TXT (cacheado)
+    # TXT
     try:
-        txt_rows = _carregar_txt_cache(txt_file.getvalue())
+        txt_rows = parse_txt(txt_file.getvalue())
     except Exception as e:
         st.error(f"Erro ao ler o TXT: {e}")
         st.stop()
@@ -498,9 +511,9 @@ if process:
         st.error("O TXT está vazio ou em formato inválido.")
         st.stop()
 
-    # Saldo (cacheado)
+    # Saldo
     try:
-        saldo_table: SaldoTable = _carregar_saldo_cache(xls_file.getvalue(), xls_file.name)
+        saldo_table: SaldoTable = parse_saldo(xls_file.getvalue(), xls_file.name)
     except FramesetXlsError:
         st.error("⚠️ O arquivo `.xls` enviado está **vazio por dentro**.")
         st.markdown("""
@@ -522,15 +535,28 @@ if process:
         st.error(f"Erro ao ler o saldo GVBUS: {e}")
         st.stop()
 
-    # AppLider (cacheado)
+    # AppLider
     try:
-        applider_table: AppLiderTable = _carregar_applider_cache(
+        applider_table: AppLiderTable = parse_applider(
             applider_file.getvalue(), applider_file.name
         )
     except Exception as e:
         st.error(f"Erro ao ler a planilha do AppLider: {e}")
         st.stop()
 
+    # ocorrências (opcional) — se anexou, valida o formato
+    ocor_df = None
+    if oc_file:
+        ocor_df = parse_ocorrencias(oc_file.getvalue(), oc_file.name)
+        if ocor_df is None:
+            st.error(
+                "Não consegui ler o relatório de ocorrências. Esperado o export "
+                "do AppLider 'Relatório de Ocorrências' (.xls/.xlsx) com as colunas "
+                "PARCEIROID, NOME FUNCIONÁRIO, DESCRIÇÃO DA OCORRÊNCIA, DIAS "
+                "DESCONTADO etc. Envie o arquivo original ou deixe o campo vazio."
+            )
+            st.stop()
+    st.session_state.ocorrencias_df = ocor_df
     st.session_state.txt_rows = txt_rows
     st.session_state.saldo_table = saldo_table
     st.session_state.applider_table = applider_table
@@ -541,8 +567,6 @@ if process:
     st.session_state.confirmed_overrides = {}
     st.session_state.validated_pairs = {}
     st.session_state.sem_escala_decisions = {}
-    # libera memória antes do rerun
-    gc.collect()
     st.rerun()
 
 
@@ -1052,6 +1076,87 @@ with dl3:
             <div class="value" style="font-size:1rem;">Nenhum caso</div>
         </div>
         """, unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Relatórios executivos (HTML + XLSX) + envio por e-mail
+# ---------------------------------------------------------------------------
+st.markdown('<div class="section-title"><span class="dot"></span>📊 Relatórios executivos + envio por e-mail</div>',
+            unsafe_allow_html=True)
+
+_oc = st.session_state.ocorrencias_df
+if _oc is None:
+    st.caption("ℹ️ Gerado **sem** o cruzamento de ocorrências (relatório não anexado).")
+else:
+    st.caption(f"🩺 Cruzando com **{len(_oc)} ocorrências** do período.")
+
+with st.spinner("Gerando relatório HTML + workbook XLSX…"):
+    html_report = build_html_report(result, _oc)
+    xlsx_bytes = build_xlsx_workbook(result, _oc)
+
+rp1, rp2 = st.columns(2)
+with rp1:
+    st.download_button(
+        "⬇️ Relatório executivo (HTML)",
+        data=html_report.encode("utf-8"),
+        file_name=f"relatorio_gvbus_{ts}.html",
+        mime="text/html",
+        use_container_width=True,
+        help="Abre no navegador. Tem tabela interativa com busca/filtro/ordenação "
+             "com todas as linhas — não precisa abrir o Excel para consultar.",
+    )
+with rp2:
+    st.download_button(
+        "⬇️ Workbook mensal (XLSX)",
+        data=xlsx_bytes,
+        file_name=f"acompanhamento_gvbus_{ts}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        help="Planilha viva do mês: filtros, colunas editáveis em laranja, "
+             "abas Ocorrências/Intercorrências e Resumo com fórmulas.",
+    )
+
+mail_ok, mail_msg = mailer_status()
+if not mail_ok:
+    st.info(
+        f"📧 **Envio automático desativado** ({mail_msg}). Para ligar: configure "
+        "a seção `[smtp]` nos secrets (modelo em `.streamlit/secrets.toml.example`). "
+        "Aí os relatórios saem por e-mail direto aqui do app."
+    )
+else:
+    with st.form("send_mail_form"):
+        st.markdown("**📧 Enviar relatórios por e-mail**")
+        dest = st.text_input(
+            "Destinatário",
+            value="liderlsgp@gmail.com",
+            key="mail_to",
+        )
+        if st.form_submit_button("📧 Enviar agora", use_container_width=True):
+            subject = (
+                f"GVBUS · Relatórios do ciclo "
+                f"{st.session_state.periodo_inicio.strftime('%d/%m/%Y')} a "
+                f"{st.session_state.periodo_fim.strftime('%d/%m/%Y')}"
+            )
+            body = (
+                "Relatórios gerados automaticamente pelo GVBUS Comparator.\n\n"
+                f"Período: {st.session_state.periodo_inicio.strftime('%d/%m/%Y')} "
+                f"a {st.session_state.periodo_fim.strftime('%d/%m/%Y')}\n"
+                f"Colaboradores: {len(result.rows)}\n"
+                f"Total TXT: R$ {result.total_txt:,.2f}\n"
+                f"A depositar: R$ {result.total_depositar:,.2f}\n"
+                f"Economia: R$ {result.total_txt - result.total_depositar:,.2f}\n\n"
+                "Anexos: relatório executivo (HTML) e workbook mensal (XLSX).\n"
+                "-- GVBUS Comparator · Líder Limpe"
+            )
+            ok, msg = send_report_email(dest, subject, body, [
+                (f"relatorio_gvbus_{ts}.html", html_report.encode("utf-8"), "text/html"),
+                (f"acompanhamento_gvbus_{ts}.xlsx", xlsx_bytes,
+                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            ])
+            if ok:
+                st.success(f"✅ {msg}")
+                st.balloons()
+            else:
+                st.error(f"Falha no envio: {msg}")
 
 with st.expander("👁️ Pré-visualização do TXT final"):
     st.code(txt_out[:5000] + ("\n... (truncado)" if len(txt_out) > 5000 else ""),
